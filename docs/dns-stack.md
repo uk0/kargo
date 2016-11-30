@@ -6,7 +6,13 @@ Kargo configures a [Kubernetes DNS](http://kubernetes.io/docs/admin/dns/)
 to serve as an authoritative DNS server for a given ``dns_domain`` and its
 ``svc, default.svc`` default subdomains (a total of ``ndots: 5`` max levels).
 
-Note, additional search (sub)domains may be defined in the ``searchdomains``
+Note, custom ``ndots`` values affect only the dnsmasq daemon set (explained below).
+While the kubedns has the ``ndots=5`` hardcoded, which is not recommended due to
+[DNS performance reasons](https://github.com/kubernetes/kubernetes/issues/14051).
+You can use config maps for the kubedns app to workaround the issue, which is
+yet in the Kargo scope.
+
+Additional search (sub)domains may be defined in the ``searchdomains``
 and ``ndots`` vars. And additional recursive DNS resolvers in the `` upstream_dns_servers``,
 ``nameservers`` vars. Intranet DNS resolvers should be specified in the first
 place, followed by external resolvers, for example:
@@ -22,6 +28,23 @@ skip_dnsmasq: false
 upstream_dns_servers: [172.18.32.6, 172.18.32.7, 8.8.8.8, 8.8.8.4]
 ```
 The vars are explained below as well.
+
+Also note, existing nameserver/search/domain records will be purged from
+the `/etc/resolv.conf`, including base/head/cloud-init config files. This
+is required for hostnet pods to be able to resolve DNS requests. New records
+will be persisted from the aforementioned vars statically in the
+`/etc/resolv.conf`, if there is no resolvconf tool and dhclient is blocked
+from updating that file. Or via resolvconf head/dhclient/cloud-init (CoreOS)
+hooks otherwise. The `zdnsupdate.sh` hook for dhclient ensures the purged
+records will not be lost for ever but only merged with new data.
+
+Important to note that multiple search domains combined with high ``ndots``
+values lead to poor performance of DNS stack, so please choose it wise.
+The dnsmasq daemon set can take lower ``ndots`` values and return NXDOMAIN
+replies for [bogus internal
+FQDNS](https://github.com/kubernetes/kubernetes/issues/19634#issuecomment-253948954)
+before it even hits the kubedns app. Which makes it to be serving as a guarding
+recursive resolver in front of the kubedns running SkyDNS as an authoritative resolver.
 
 DNS configuration details
 -------------------------
@@ -78,8 +101,7 @@ Limitations
   [no way to specify a custom value](https://github.com/kubernetes/kubernetes/issues/33554)
   for the SkyDNS ``ndots`` param via an
   [option for KubeDNS](https://github.com/kubernetes/kubernetes/blob/master/cmd/kube-dns/app/options/options.go)
-  add-on, while SkyDNS supports it though. Thus, DNS SRV records may not work
-  as expected as they require the ``ndots:7``.
+  add-on, while SkyDNS supports it though.
 
 * the ``searchdomains`` have a limitation of a 6 names and 256 chars
   length. Due to default ``svc, default.svc`` subdomains, the actual
