@@ -9,7 +9,21 @@
   set_fact:
     resolvconffile: >-
       {%- if resolvconf.rc == 0 -%}/etc/resolvconf/resolv.conf.d/head{%- else -%}/etc/resolv.conf{%- endif -%}
+    base: >-
+      {%- if resolvconf.rc == 0 -%}['/etc/resolvconf/resolv.conf.d/base']{%- else -%}[]{%- endif -%}
   when: ansible_os_family != "CoreOS"
+
+- name: target dhclient conf/hook files for Red Hat family
+  set_fact:
+    dhclientconffile: /etc/dhclient.conf
+    dhclienthookfile: /etc/dhcp/dhclient.d/zdnsupdate.sh
+  when: ansible_os_family == "RedHat"
+
+- name: target dhclient conf/hook files for Debian family
+  set_fact:
+    dhclientconffile: /etc/dhcp/dhclient.conf
+    dhclienthookfile: /etc/dhcp/dhclient-enter-hooks.d/zdnsupdate.sh
+  when: ansible_os_family == "Debian"
 
 - name: target temporary resolvconf cloud init file
   set_fact:
@@ -23,7 +37,9 @@
 - name: generate search domains to resolvconf
   set_fact:
     searchentries:
-      "{{ ([ 'default.svc.' + dns_domain, 'svc.' + dns_domain ] + searchdomains|default([])) | join(' ') }}"
+      search {{ ([ 'default.svc.' + dns_domain, 'svc.' + dns_domain ] + searchdomains|default([])) | join(' ') }}
+    prepend_search:
+      prepend domain-search "{{ ([ 'default.svc.' + dns_domain, 'svc.' + dns_domain ] + searchdomains|default([])) | join('", "') }}";
 
 - name: pick dnsmasq cluster IP
   set_fact:
@@ -33,57 +49,35 @@
 - name: generate nameservers to resolvconf
   set_fact:
     nameserverentries:
-      "{{ dnsmasq_server|default([]) + nameservers|default([]) }}"
+      nameserver {{( dnsmasq_server|default([]) + nameservers|default([])) | join(',nameserver ')}}
+    prepend_nameserver:
+      prepend domain-name-servers {{( dnsmasq_server|default([]) + nameservers|default([])) | join(', ') }};
 
-- name: Remove search and nameserver options from resolvconf head
+- name: Remove search/domain/nameserver options
   lineinfile:
-    dest: /etc/resolvconf/resolv.conf.d/head
+    dest: "{{item[0]}}"
     state: absent
-    regexp: "^{{ item }}.*$"
+    regexp: "^{{ item[1] }}.*$"
     backup: yes
     follow: yes
-  with_items:
-    - search
-    - nameserver
-  when: resolvconf.rc == 0
+  with_nested:
+    - "{{ [resolvconffile] + base|default([]) }}"
+    - [ 'search', 'nameserver', 'domain' ]
   notify: Dnsmasq | update resolvconf
 
-- name: Remove search and nameserver options from resolvconf cloud init temporary file
-  lineinfile:
-    dest: "{{resolvconffile}}"
-    state: absent
-    regexp: "^{{ item }}.*$"
-    backup: yes
-    follow: yes
-  with_items:
-    - search
-    - nameserver
-  when: ansible_os_family == "CoreOS"
-  notify: Dnsmasq | update resolvconf for CoreOS
-
-- name: Add search domains to resolvconf file
-  lineinfile:
-    line: "search {{searchentries}}"
-    dest: "{{resolvconffile}}"
-    state: present
-    insertbefore: BOF
-    backup: yes
-    follow: yes
-  notify: Dnsmasq | update resolvconf
-
-- name: Add nameservers to resolv.conf
+- name: Add search/nameservers to resolv.conf
   blockinfile:
     dest: "{{resolvconffile}}"
     block: |-
-      {% for item in nameserverentries -%}
-      nameserver {{ item }}
+      {% for item in [searchentries] + nameserverentries.split(',') -%}
+      {{ item }}
       {% endfor %}
     state: present
-    insertafter: "^search default.svc.*$"
+    insertbefore: BOF
     create: yes
     backup: yes
     follow: yes
-    marker: "# Ansible nameservers {mark}"
+    marker: "# Ansible entries {mark}"
   notify: Dnsmasq | update resolvconf
 
 - name: Add options to resolv.conf
@@ -101,28 +95,30 @@
     - attempts:2
   notify: Dnsmasq | update resolvconf
 
-- name: Remove search and nameserver options from resolvconf base
-  lineinfile:
-    dest: /etc/resolvconf/resolv.conf.d/base
-    state: absent
-    regexp: "^{{ item }}.*$"
+- name: Configure dhclient to prepend search/nameservers
+  blockinfile:
+    block: |-
+      {% for item in [ prepend_search, prepend_nameserver ] -%}
+      {{ item }}
+      {% endfor %}
+    dest: "{{dhclientconffile}}"
+    create: yes
+    state: present
+    insertbefore: BOF
     backup: yes
     follow: yes
-  with_items:
-    - search
-    - nameserver
-  when: resolvconf.rc == 0
-  notify: Dnsmasq | update resolvconf
-
-- name: disable resolv.conf modification by dhclient
-  copy: src=dhclient_nodnsupdate dest=/etc/dhcp/dhclient-enter-hooks.d/znodnsupdate mode=0755
+    marker: "# Ansible entries {mark}"
   notify: Dnsmasq | restart network
-  when: ansible_os_family == "Debian"
+  when: ansible_os_family != "CoreOS"
 
-- name: disable resolv.conf modification by dhclient
-  copy: src=dhclient_nodnsupdate dest=/etc/dhcp/dhclient.d/nodnsupdate mode=u+x
+- name: Configue dhclient hooks for resolv.conf
+  template:
+    src: dhclient_dnsupdate.sh.j2
+    dest: "{{ dhclienthookfile }}"
+    owner: root
+    mode: 0755
   notify: Dnsmasq | restart network
-  when: ansible_os_family == "RedHat"
+  when: ansible_os_family != "CoreOS"
 
 - name: get temporary resolveconf cloud init file content
   command: cat {{ resolvconffile }}
